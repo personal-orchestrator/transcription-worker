@@ -1,6 +1,8 @@
+import asyncio
 import os
 import json
 import pytest
+from datetime import datetime, timezone
 from unittest.mock import Mock, patch, AsyncMock
 from app.workers.transcription import TranscriptionWorker
 from app.services.transcription import TranscriptionResult, TranscriptionService
@@ -182,3 +184,74 @@ async def test_handle_message_non_english(temp_dirs):
         translated_data = json.loads(f.readlines()[0])
         assert translated_data["transcription"] == "This is a translated test transcription"
         assert translated_data["language"] == "en"
+
+class SlowTranscriptionService(MockTranscriptionService):
+    """Transcription slow enough to outlive a short heartbeat interval."""
+
+    def __init__(self, duration=0.05, language="en"):
+        super().__init__(language=language)
+        self.duration = duration
+
+    async def transcribe(self, audio_file_path: str) -> TranscriptionResult:
+        await asyncio.sleep(self.duration)
+        return await super().transcribe(audio_file_path)
+
+def _heartbeat_worker(temp_dirs):
+    storage_dir, transcriptions_raw_dir, transcriptions_dir = temp_dirs
+    return TranscriptionWorker(
+        transcription_service=SlowTranscriptionService(duration=0.05),
+        storage_dir=storage_dir,
+        transcriptions_raw_dir=transcriptions_raw_dir,
+        transcriptions_dir=transcriptions_dir,
+        progress_interval=0.001,
+    )
+
+def _js_msg(filename, storage_dir):
+    os.makedirs(storage_dir, exist_ok=True)
+    with open(os.path.join(storage_dir, filename), "wb") as f:
+        f.write(b"dummy data")
+
+    msg = Mock()
+    msg.subject = "audio.ingested"
+    msg.data = json.dumps({"filename": filename}).encode("utf-8")
+    msg.ack = AsyncMock()
+    msg.in_progress = AsyncMock()
+    return msg
+
+@pytest.mark.asyncio
+async def test_heartbeat_sent_while_transcribing(temp_dirs):
+    storage_dir, _, _ = temp_dirs
+    worker = _heartbeat_worker(temp_dirs)
+    msg = _js_msg("slow_audio.m4a", storage_dir)
+
+    await worker.handle_message(msg)
+
+    assert msg.in_progress.await_count > 0
+    msg.ack.assert_awaited_once()
+
+@pytest.mark.asyncio
+async def test_heartbeat_stops_once_processing_finishes(temp_dirs):
+    storage_dir, _, _ = temp_dirs
+    worker = _heartbeat_worker(temp_dirs)
+    msg = _js_msg("slow_audio.m4a", storage_dir)
+
+    await worker.handle_message(msg)
+    settled = msg.in_progress.await_count
+
+    await asyncio.sleep(0.05)
+
+    assert msg.in_progress.await_count == settled
+
+@pytest.mark.asyncio
+async def test_failing_heartbeat_does_not_fail_the_message(temp_dirs):
+    """in_progress() raises on a message with no JetStream reply subject; work must still finish."""
+    storage_dir, _, transcriptions_dir = temp_dirs
+    worker = _heartbeat_worker(temp_dirs)
+    msg = _js_msg("slow_audio.m4a", storage_dir)
+    msg.in_progress = AsyncMock(side_effect=RuntimeError("not a JetStream message"))
+
+    await worker.handle_message(msg)
+
+    msg.ack.assert_awaited_once()
+    date_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    assert os.path.exists(os.path.join(transcriptions_dir, f"transcripts_{date_str}.jsonl"))

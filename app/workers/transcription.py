@@ -1,8 +1,9 @@
+import asyncio
 import fcntl
 import json
 import logging
 import os
-from contextlib import contextmanager
+from contextlib import asynccontextmanager, contextmanager, suppress
 from datetime import datetime, timezone
 from typing import Optional, TYPE_CHECKING
 from pydantic import BaseModel, ValidationError
@@ -32,7 +33,8 @@ class TranscriptionWorker:
         transcriptions_raw_dir: str, 
         transcriptions_dir: str, 
         nc: Optional['NatsClient'] = None, 
-        nats_transcriptions_subject: Optional[str] = None
+        nats_transcriptions_subject: Optional[str] = None,
+        progress_interval: float = 60.0
     ):
         self.transcription_service = transcription_service
         self.storage_dir = storage_dir
@@ -40,6 +42,7 @@ class TranscriptionWorker:
         self.transcriptions_dir = transcriptions_dir
         self.nc = nc
         self.nats_transcriptions_subject = nats_transcriptions_subject
+        self.progress_interval = progress_interval
 
         os.makedirs(self.storage_dir, exist_ok=True)
         os.makedirs(self.transcriptions_raw_dir, exist_ok=True)
@@ -59,7 +62,8 @@ class TranscriptionWorker:
                 await msg.ack()
                 return
 
-            await self._process_file(file_path, payload.filename, payload.out_of_order)
+            async with self._keep_alive(msg):
+                await self._process_file(file_path, payload.filename, payload.out_of_order)
             await msg.ack()
 
         except ValidationError as e:
@@ -67,6 +71,37 @@ class TranscriptionWorker:
             await msg.ack()
         except Exception as e:
             logger.error(f"Error processing message: {e}", exc_info=True)
+
+    @asynccontextmanager
+    async def _keep_alive(self, msg: 'Msg'):
+        """Hold the message's ack_wait timer open for as long as the body takes."""
+        task = None
+        if self.progress_interval > 0:
+            task = asyncio.create_task(self._send_progress(msg))
+        try:
+            yield
+        finally:
+            if task is not None:
+                task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await task
+
+    async def _send_progress(self, msg: 'Msg') -> None:
+        """Periodically tell JetStream the message is still being worked on.
+
+        A file needs two rate-limited Groq calls, which routinely outruns any fixed ack_wait.
+        The +WPI this sends resets that timer without counting as a delivery, so a slow file
+        stays on its first delivery instead of being handed out again and re-transcribed.
+        """
+        while True:
+            await asyncio.sleep(self.progress_interval)
+            try:
+                await msg.in_progress()
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                logger.debug(f"Stopping in-progress heartbeat: {e}")
+                return
 
     def _get_file_path(self, filename: str) -> Optional[str]:
         file_path = os.path.join(self.storage_dir, filename)

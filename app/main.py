@@ -7,7 +7,7 @@ from typing import Callable, Awaitable, Any, List
 
 import nats
 from nats.aio.client import Client as NatsClient
-from nats.js import JetStreamContext
+from nats.js import JetStreamContext, api
 
 from app.config import settings
 from app.services.transcription import GroqTranscriptionService, TranscriptionService
@@ -25,6 +25,7 @@ class SubscriptionConfig:
     cb: Callable[[Any], Awaitable[None]]
     durable: str
     stream: str
+    consumer_config: api.ConsumerConfig
 
 logging.basicConfig(level=settings.log_level, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("transcription-worker")
@@ -71,6 +72,7 @@ class Application:
             transcriptions_dir=settings.transcriptions_dir,
             nc=self.nc,
             nats_transcriptions_subject=settings.nats_transcriptions_subject,
+            progress_interval=settings.nats_progress_interval,
         )
 
     def _create_transcription_service(self) -> TranscriptionService:
@@ -92,6 +94,20 @@ class Application:
             except Exception as e:
                 logger.info(f"Stream '{stream.name}' check/creation note: {e}")
 
+    @staticmethod
+    def _consumer_config() -> api.ConsumerConfig:
+        """Consumer settings sized for a single worker doing multi-minute, rate-limited work.
+
+        NOTE: nats-py only applies this when the durable consumer does not exist yet. An
+        already-created consumer keeps whatever config the server holds, so consumers that
+        predate this change need a one-off `nats consumer edit`.
+        """
+        return api.ConsumerConfig(
+            ack_wait=settings.nats_ack_wait,
+            max_deliver=settings.nats_max_deliver,
+            max_ack_pending=settings.nats_max_ack_pending,
+        )
+
     async def _subscribe_consumers(self) -> None:
         configs = [
             SubscriptionConfig(
@@ -99,6 +115,7 @@ class Application:
                 cb=self.worker.handle_message,
                 durable="transcription-worker-consumer",
                 stream="audio_events",
+                consumer_config=self._consumer_config(),
             ),
         ]
         for cfg in configs:
@@ -107,9 +124,14 @@ class Application:
                 cb=cfg.cb,
                 durable=cfg.durable,
                 stream=cfg.stream,
+                config=cfg.consumer_config,
             )
             self.subscriptions.append(sub)
-            logger.info(f"Subscribed to {cfg.subject} (durable: {cfg.durable}, stream: {cfg.stream})")
+            logger.info(
+                f"Subscribed to {cfg.subject} (durable: {cfg.durable}, stream: {cfg.stream}, "
+                f"ack_wait: {cfg.consumer_config.ack_wait}s, max_deliver: {cfg.consumer_config.max_deliver}, "
+                f"max_ack_pending: {cfg.consumer_config.max_ack_pending})"
+            )
 
     def _setup_signal_handlers(self) -> None:
         loop = asyncio.get_running_loop()
