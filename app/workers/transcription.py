@@ -3,7 +3,6 @@ import fcntl
 import json
 import logging
 import os
-import time
 from contextlib import asynccontextmanager, contextmanager, suppress
 from datetime import datetime, timezone
 from typing import Optional, TYPE_CHECKING
@@ -20,13 +19,6 @@ logger = logging.getLogger("transcription-worker")
 # Must stay below the consumer's ack_wait, including the 30s server default that applies until
 # the one-off `nats consumer edit` in the README has been run.
 PROGRESS_INTERVAL_SECONDS = 20.0
-
-# How long the heartbeat will hold a single message alive. Past this the beats stop, ack_wait
-# expires and the message is redelivered. Without a cap a hung upstream call would be held alive
-# forever: max_deliver only engages on redelivery, and with max_ack_pending=1 the consumer would
-# never receive another message. Set above the real worst case, which is roughly half an hour for
-# a non-English file once Groq's own retries are counted.
-MAX_KEEPALIVE_SECONDS = 2400.0
 
 class TranscriptionPayload(BaseModel):
     filename: str
@@ -46,8 +38,7 @@ class TranscriptionWorker:
         transcriptions_dir: str, 
         nc: Optional['NatsClient'] = None, 
         nats_transcriptions_subject: Optional[str] = None,
-        progress_interval: float = PROGRESS_INTERVAL_SECONDS,
-        max_keepalive: float = MAX_KEEPALIVE_SECONDS
+        progress_interval: float = PROGRESS_INTERVAL_SECONDS
     ):
         self.transcription_service = transcription_service
         self.storage_dir = storage_dir
@@ -56,7 +47,6 @@ class TranscriptionWorker:
         self.nc = nc
         self.nats_transcriptions_subject = nats_transcriptions_subject
         self.progress_interval = progress_interval
-        self.max_keepalive = max_keepalive
 
         os.makedirs(self.storage_dir, exist_ok=True)
         os.makedirs(self.transcriptions_raw_dir, exist_ok=True)
@@ -103,18 +93,12 @@ class TranscriptionWorker:
         +WPI resets the ack timer without counting as a delivery, so a slow file stays on its
         first delivery. A failed beat is transient (a reconnect), so the loop keeps going.
         """
-        deadline = time.monotonic() + self.max_keepalive
-        while time.monotonic() < deadline:
+        while True:
             await asyncio.sleep(self.progress_interval)
             try:
                 await msg.in_progress()
             except Exception as e:
                 logger.warning(f"In-progress heartbeat failed, retrying next tick: {e}")
-
-        logger.error(
-            f"Held a message alive for {self.max_keepalive}s without finishing; giving up so "
-            f"ack_wait can expire and it is redelivered rather than blocking the consumer"
-        )
 
     def _get_file_path(self, filename: str) -> Optional[str]:
         file_path = os.path.join(self.storage_dir, filename)

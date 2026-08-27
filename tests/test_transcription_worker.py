@@ -254,25 +254,3 @@ async def test_failing_heartbeat_neither_stops_beating_nor_fails_the_message(
     queued_audio_msg.ack.assert_awaited_once()
     date_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     assert os.path.exists(os.path.join(transcriptions_dir, f"transcripts_{date_str}.jsonl"))
-
-@pytest.mark.asyncio
-async def test_heartbeat_gives_up_after_max_keepalive(temp_dirs, queued_audio_msg):
-    """An unbounded heartbeat would hold a hung message alive forever.
-
-    max_deliver only engages on redelivery, and with max_ack_pending=1 the consumer would never
-    be handed another message — one stuck call would silence it behind a healthy-looking pod.
-    """
-    storage_dir, raw_dir, transcriptions_dir = temp_dirs
-    worker = TranscriptionWorker(
-        transcription_service=SlowTranscriptionService(),
-        storage_dir=storage_dir,
-        transcriptions_raw_dir=raw_dir,
-        transcriptions_dir=transcriptions_dir,
-        progress_interval=0.001,
-        max_keepalive=0.005,
-    )
-
-    await worker.handle_message(queued_audio_msg)
-
-    # The body runs ~0.05s, ten times the cap, so beating must have stopped well before it ended.
-    assert 0 < queued_audio_msg.in_progress.await_count < 20

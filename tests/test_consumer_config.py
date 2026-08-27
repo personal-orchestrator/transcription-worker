@@ -3,7 +3,7 @@ from unittest.mock import AsyncMock, Mock
 import pytest
 
 from app.main import Application
-from app.workers.transcription import MAX_KEEPALIVE_SECONDS, PROGRESS_INTERVAL_SECONDS
+from app.workers.transcription import PROGRESS_INTERVAL_SECONDS
 
 
 @pytest.mark.asyncio
@@ -35,8 +35,3 @@ def test_heartbeat_outpaces_the_server_default_ack_wait():
     already been redelivered.
     """
     assert PROGRESS_INTERVAL_SECONDS < 30
-
-
-def test_keepalive_cap_exceeds_the_real_worst_case():
-    """Two Groq phases, five tenacity attempts each, with the SDK's own retries inside."""
-    assert MAX_KEEPALIVE_SECONDS > 1905
