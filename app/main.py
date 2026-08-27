@@ -26,13 +26,9 @@ class SubscriptionConfig:
     durable: str
     stream: str
 
-# Consumer settings sized for a single worker doing multi-minute, rate-limited work. The server
-# defaults (ack_wait=30s, max_deliver=-1, max_ack_pending=1000) push a deep backlog at a worker
-# that drains it serially, and every ack_wait expiry costs another billed transcription.
-#
-# ACK_WAIT is a death-detection window, not a duration budget: a non-English file can legitimately
-# run far longer than 300s once Groq's own retries are counted, and TranscriptionWorker's periodic
-# msg.in_progress() is what carries it. See README.
+# Server defaults (ack_wait=30s, max_deliver=-1, max_ack_pending=1000) are wrong for a single
+# worker doing slow, rate-limited work. ACK_WAIT_SECONDS is a death-detection window, not a
+# duration budget — the msg.in_progress() heartbeat covers duration. See README.
 ACK_WAIT_SECONDS = 300.0
 MAX_DELIVER = 3
 MAX_ACK_PENDING = 1
@@ -113,17 +109,17 @@ class Application:
             ),
         ]
         for cfg in configs:
+            config = api.ConsumerConfig(
+                ack_wait=ACK_WAIT_SECONDS,
+                max_deliver=MAX_DELIVER,
+                max_ack_pending=MAX_ACK_PENDING,
+            )
             sub = await self.js.subscribe(
                 cfg.subject,
                 cb=cfg.cb,
                 durable=cfg.durable,
                 stream=cfg.stream,
-                # Built per call: js.subscribe mutates the config it is handed.
-                config=api.ConsumerConfig(
-                    ack_wait=ACK_WAIT_SECONDS,
-                    max_deliver=MAX_DELIVER,
-                    max_ack_pending=MAX_ACK_PENDING,
-                ),
+                config=config,
             )
             self.subscriptions.append(sub)
             logger.info(f"Subscribed to {cfg.subject} (durable: {cfg.durable}, stream: {cfg.stream})")

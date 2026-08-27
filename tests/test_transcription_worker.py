@@ -188,25 +188,26 @@ async def test_handle_message_non_english(temp_dirs):
 class SlowTranscriptionService(MockTranscriptionService):
     """Transcription slow enough to outlive a short heartbeat interval."""
 
-    def __init__(self, duration=0.05, language="en"):
-        super().__init__(language=language)
-        self.duration = duration
-
     async def transcribe(self, audio_file_path: str) -> TranscriptionResult:
-        await asyncio.sleep(self.duration)
+        await asyncio.sleep(0.05)
         return await super().transcribe(audio_file_path)
 
-def _heartbeat_worker(temp_dirs):
+@pytest.fixture
+def heartbeat_worker(temp_dirs):
     storage_dir, transcriptions_raw_dir, transcriptions_dir = temp_dirs
     return TranscriptionWorker(
-        transcription_service=SlowTranscriptionService(duration=0.05),
+        transcription_service=SlowTranscriptionService(),
         storage_dir=storage_dir,
         transcriptions_raw_dir=transcriptions_raw_dir,
         transcriptions_dir=transcriptions_dir,
         progress_interval=0.001,
     )
 
-def _js_msg(filename, storage_dir):
+@pytest.fixture
+def queued_audio_msg(temp_dirs):
+    """A JetStream message whose audio file exists on disk."""
+    storage_dir = temp_dirs[0]
+    filename = "slow_audio.m4a"
     os.makedirs(storage_dir, exist_ok=True)
     with open(os.path.join(storage_dir, filename), "wb") as f:
         f.write(b"dummy data")
@@ -219,59 +220,59 @@ def _js_msg(filename, storage_dir):
     return msg
 
 @pytest.mark.asyncio
-async def test_heartbeat_sent_while_transcribing(temp_dirs):
-    storage_dir, _, _ = temp_dirs
-    worker = _heartbeat_worker(temp_dirs)
-    msg = _js_msg("slow_audio.m4a", storage_dir)
+async def test_heartbeat_sent_while_transcribing(heartbeat_worker, queued_audio_msg):
+    await heartbeat_worker.handle_message(queued_audio_msg)
 
-    await worker.handle_message(msg)
-
-    assert msg.in_progress.await_count > 0
-    msg.ack.assert_awaited_once()
+    assert queued_audio_msg.in_progress.await_count > 0
+    queued_audio_msg.ack.assert_awaited_once()
 
 @pytest.mark.asyncio
-async def test_heartbeat_stops_once_processing_finishes(temp_dirs):
-    storage_dir, _, _ = temp_dirs
-    worker = _heartbeat_worker(temp_dirs)
-    msg = _js_msg("slow_audio.m4a", storage_dir)
-
-    await worker.handle_message(msg)
-    settled = msg.in_progress.await_count
+async def test_heartbeat_stops_once_processing_finishes(heartbeat_worker, queued_audio_msg):
+    await heartbeat_worker.handle_message(queued_audio_msg)
+    settled = queued_audio_msg.in_progress.await_count
 
     await asyncio.sleep(0.05)
 
     assert settled > 0, "no heartbeat ran, so this proves nothing about it stopping"
-    assert msg.in_progress.await_count == settled
+    assert queued_audio_msg.in_progress.await_count == settled
 
 @pytest.mark.asyncio
-async def test_heartbeat_recovers_from_a_transient_failure(temp_dirs):
-    """One failed +WPI must not retire the heartbeat for the rest of the message.
+async def test_failing_heartbeat_neither_stops_beating_nor_fails_the_message(
+    heartbeat_worker, queued_audio_msg, temp_dirs
+):
+    """A failed +WPI is transient, so the loop must keep going and the work must complete.
 
-    in_progress() is a publish, and nats-py raises while the client is mid-reconnect. Giving
-    up on the first failure would let ack_wait expire on a file that is still being worked on,
-    which is the redelivery this change exists to stop.
+    Beating more than once while every beat raises proves both halves: the loop survived a
+    failure, and the failure never reached handle_message.
     """
-    storage_dir, _, _ = temp_dirs
-    worker = _heartbeat_worker(temp_dirs)
-    msg = _js_msg("slow_audio.m4a", storage_dir)
-    msg.in_progress = AsyncMock(side_effect=[RuntimeError("connection draining")] + [None] * 500)
+    _, _, transcriptions_dir = temp_dirs
+    queued_audio_msg.in_progress = AsyncMock(side_effect=RuntimeError("connection draining"))
 
-    await worker.handle_message(msg)
+    await heartbeat_worker.handle_message(queued_audio_msg)
 
-    assert msg.in_progress.await_count > 1, "heartbeat stopped after the first failure"
-    msg.ack.assert_awaited_once()
-
-@pytest.mark.asyncio
-async def test_failing_heartbeat_does_not_fail_the_message(temp_dirs):
-    """A heartbeat that never succeeds must not stop the transcription from completing."""
-    storage_dir, _, transcriptions_dir = temp_dirs
-    worker = _heartbeat_worker(temp_dirs)
-    msg = _js_msg("slow_audio.m4a", storage_dir)
-    msg.in_progress = AsyncMock(side_effect=RuntimeError("not a JetStream message"))
-
-    await worker.handle_message(msg)
-
-    assert msg.in_progress.await_count > 0, "the raising path was never exercised"
-    msg.ack.assert_awaited_once()
+    assert queued_audio_msg.in_progress.await_count > 1, "heartbeat stopped after the first failure"
+    queued_audio_msg.ack.assert_awaited_once()
     date_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     assert os.path.exists(os.path.join(transcriptions_dir, f"transcripts_{date_str}.jsonl"))
+
+@pytest.mark.asyncio
+async def test_heartbeat_gives_up_after_max_keepalive(temp_dirs, queued_audio_msg):
+    """An unbounded heartbeat would hold a hung message alive forever.
+
+    max_deliver only engages on redelivery, and with max_ack_pending=1 the consumer would never
+    be handed another message — one stuck call would silence it behind a healthy-looking pod.
+    """
+    storage_dir, raw_dir, transcriptions_dir = temp_dirs
+    worker = TranscriptionWorker(
+        transcription_service=SlowTranscriptionService(),
+        storage_dir=storage_dir,
+        transcriptions_raw_dir=raw_dir,
+        transcriptions_dir=transcriptions_dir,
+        progress_interval=0.001,
+        max_keepalive=0.005,
+    )
+
+    await worker.handle_message(queued_audio_msg)
+
+    # The body runs ~0.05s, ten times the cap, so beating must have stopped well before it ended.
+    assert 0 < queued_audio_msg.in_progress.await_count < 20

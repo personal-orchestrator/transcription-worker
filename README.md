@@ -14,48 +14,52 @@ Dedicated, isolated audio transcription worker for the personal orchestrator pla
 ## JetStream consumer configuration
 
 The durable consumer is created with explicit settings rather than NATS server defaults, which
-are a poor fit for this workload — a single file takes two rate-limited Groq calls, far longer
-than the default 30s `ack_wait`. The values are constants in `app/main.py`:
+are a poor fit for this workload — a Polish file takes two rate-limited Groq calls (English takes
+one), far longer than the default 30s `ack_wait`. The values are constants in `app/main.py` and
+`app/workers/transcription.py`:
 
 | setting | value | why |
 | --- | --- | --- |
-| `ack_wait` | 300s | a **death-detection window**, not a duration budget — see below |
+| `ack_wait` | 300s | a **death-detection window**, not a duration budget — the heartbeat covers duration |
 | `max_deliver` | 3 | a finite redelivery ceiling; the server default of `-1` retries forever |
 | `max_ack_pending` | 1 | the worker drains messages serially at `replicas: 1` |
 | progress interval | 20s | how often `msg.in_progress()` (`+WPI`) resets the ack timer while a file is in flight |
+| max keepalive | 2400s | how long the heartbeat will hold one message before giving up |
 
-**`ack_wait` is not sized to cover the work.** It cannot be: counting the Groq SDK's own retries
-inside each `tenacity` attempt, a non-English file has a worst case on the order of half an hour.
-`ack_wait` is how long the server waits after the last sign of life before assuming the worker
-died. The heartbeat is what covers duration — `+WPI` resets the timer without counting as a
-delivery, so a slow transcription stays on its first delivery instead of being handed out again
-and re-transcribed. If the worker dies the beats stop, `ack_wait` expires, and the message is
-redelivered, which is the behaviour you want.
+The interval is 20s rather than something sized against our own 300s because it also has to beat
+the **30s server default** in force until the step below has been run.
 
-The progress interval is 20s rather than something sized against our own 300s because it also has
-to beat the **30s server default** that is in force until the step below has been run. A failed
-beat is logged and retried on the next tick; one transient publish error during a reconnect must
-not retire the protection for the rest of the file.
+The keepalive cap is what stops the heartbeat becoming a hazard. A heartbeat that never expires
+would hold a hung call alive forever: `max_deliver` only engages on redelivery, and with
+`max_ack_pending=1` the consumer would never be handed another message — it would go silent behind
+a live, healthy-looking pod. Past the cap the beats stop, `ack_wait` expires, and the message is
+redelivered as it should be. 2400s is set above the real worst case, roughly half an hour for a
+non-English file once Groq's own retries are counted.
 
-### Applying this to an existing consumer — run this first
+### Applying this to an existing consumer
 
-`nats-py`'s `js.subscribe()` only applies the config when the durable consumer does not yet
-exist; an existing one keeps whatever the server holds, and the code does not detect or repair
-that. **On any cluster where the consumer already exists, this one-off command is the entire
-fix** — the code change only governs consumers created from scratch afterwards.
+`nats-py`'s `js.subscribe()` only applies the config when the durable does not yet exist; an
+existing one keeps whatever the server holds, and the code does not detect or repair that. The
+heartbeat ships in code and applies either way, but the three consumer settings do not — on an
+existing cluster they arrive only via:
 
 ```bash
 nats consumer edit audio_events transcription-worker-consumer \
-  --ack-wait=5m --max-deliver=3 --max-pending=1
+  --ack-wait=5m --max-pending=1
+nats consumer edit audio_events transcription-worker-consumer --max-deliver=3
 ```
 
-Run it **before** deploying, not after. Deploying first leaves an interim window still running
-`max_ack_pending=1000`, which is the setting responsible for most of the redelivery: the server
-pushes a 1000-deep batch that the worker drains one at a time while every queued message's ack
-timer runs down.
+**Two commands, in that order, and check the backlog between them.** Setting `--max-deliver=3`
+makes the server immediately stop redelivering anything already at or past three deliveries —
+against the measured state, where pending messages had accumulated hundreds of deliveries each,
+that discards the entire in-flight backlog at the moment you run it. `--ack-wait` and
+`--max-pending` stop the amplification without dropping anything, so apply those first, let the
+backlog drain (`nats consumer info audio_events transcription-worker-consumer`, watch
+`Unprocessed Messages` fall), and only then set the ceiling.
 
-Use `edit` rather than delete-and-recreate so the consumer keeps its ack floor and does not
-replay the stream from the start. Verify with `nats consumer info audio_events
-transcription-worker-consumer` — the startup log deliberately does **not** print the effective
-settings, because `js.subscribe()` cannot know them; `consumer info` is the only source of truth.
-`Redelivered Messages` should stay near zero under normal load.
+The audio files themselves survive either way here — the reindexer rescans for untranscribed
+recordings — but `ai-worker` has no such backstop, so the same care matters more there.
+
+Use `edit` rather than delete-and-recreate so the consumer keeps its ack floor and does not replay
+the stream from the start. `nats consumer info` is the source of truth for what is actually in
+force; `Redelivered Messages` should stay near zero under normal load.
