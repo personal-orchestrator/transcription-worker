@@ -34,7 +34,9 @@ class TranscriptionWorker:
         transcriptions_dir: str, 
         nc: Optional['NatsClient'] = None, 
         nats_transcriptions_subject: Optional[str] = None,
-        progress_interval: float = 60.0
+        # Must stay well below the consumer's ack_wait, including the 30s server default that
+        # applies until the one-off `nats consumer edit` in the README has been run.
+        progress_interval: float = 20.0
     ):
         self.transcription_service = transcription_service
         self.storage_dir = storage_dir
@@ -75,16 +77,13 @@ class TranscriptionWorker:
     @asynccontextmanager
     async def _keep_alive(self, msg: 'Msg'):
         """Hold the message's ack_wait timer open for as long as the body takes."""
-        task = None
-        if self.progress_interval > 0:
-            task = asyncio.create_task(self._send_progress(msg))
+        task = asyncio.create_task(self._send_progress(msg))
         try:
             yield
         finally:
-            if task is not None:
-                task.cancel()
-                with suppress(asyncio.CancelledError):
-                    await task
+            task.cancel()
+            with suppress(asyncio.CancelledError):
+                await task
 
     async def _send_progress(self, msg: 'Msg') -> None:
         """Periodically tell JetStream the message is still being worked on.
@@ -92,16 +91,18 @@ class TranscriptionWorker:
         A file needs two rate-limited Groq calls, which routinely outruns any fixed ack_wait.
         The +WPI this sends resets that timer without counting as a delivery, so a slow file
         stays on its first delivery instead of being handed out again and re-transcribed.
+
+        A failed beat is logged and retried on the next tick rather than ending the loop: the
+        publish fails transiently while the client reconnects, and giving up on the first one
+        would silently retire the protection for the rest of a multi-minute file. The loop is
+        ended by _keep_alive cancelling it.
         """
         while True:
             await asyncio.sleep(self.progress_interval)
             try:
                 await msg.in_progress()
-            except asyncio.CancelledError:
-                raise
             except Exception as e:
-                logger.debug(f"Stopping in-progress heartbeat: {e}")
-                return
+                logger.warning(f"In-progress heartbeat failed, retrying next tick: {e}")
 
     def _get_file_path(self, filename: str) -> Optional[str]:
         file_path = os.path.join(self.storage_dir, filename)

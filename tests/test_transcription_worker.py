@@ -240,11 +240,30 @@ async def test_heartbeat_stops_once_processing_finishes(temp_dirs):
 
     await asyncio.sleep(0.05)
 
+    assert settled > 0, "no heartbeat ran, so this proves nothing about it stopping"
     assert msg.in_progress.await_count == settled
 
 @pytest.mark.asyncio
+async def test_heartbeat_recovers_from_a_transient_failure(temp_dirs):
+    """One failed +WPI must not retire the heartbeat for the rest of the message.
+
+    in_progress() is a publish, and nats-py raises while the client is mid-reconnect. Giving
+    up on the first failure would let ack_wait expire on a file that is still being worked on,
+    which is the redelivery this change exists to stop.
+    """
+    storage_dir, _, _ = temp_dirs
+    worker = _heartbeat_worker(temp_dirs)
+    msg = _js_msg("slow_audio.m4a", storage_dir)
+    msg.in_progress = AsyncMock(side_effect=[RuntimeError("connection draining")] + [None] * 500)
+
+    await worker.handle_message(msg)
+
+    assert msg.in_progress.await_count > 1, "heartbeat stopped after the first failure"
+    msg.ack.assert_awaited_once()
+
+@pytest.mark.asyncio
 async def test_failing_heartbeat_does_not_fail_the_message(temp_dirs):
-    """in_progress() raises on a message with no JetStream reply subject; work must still finish."""
+    """A heartbeat that never succeeds must not stop the transcription from completing."""
     storage_dir, _, transcriptions_dir = temp_dirs
     worker = _heartbeat_worker(temp_dirs)
     msg = _js_msg("slow_audio.m4a", storage_dir)
@@ -252,6 +271,7 @@ async def test_failing_heartbeat_does_not_fail_the_message(temp_dirs):
 
     await worker.handle_message(msg)
 
+    assert msg.in_progress.await_count > 0, "the raising path was never exercised"
     msg.ack.assert_awaited_once()
     date_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     assert os.path.exists(os.path.join(transcriptions_dir, f"transcripts_{date_str}.jsonl"))
