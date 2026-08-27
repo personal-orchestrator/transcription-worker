@@ -28,11 +28,12 @@ one), far longer than the default 30s `ack_wait`. The values are constants in `a
 The interval is 20s rather than something sized against our own 300s because it also has to beat
 the **30s server default** in force until the step below has been run.
 
-**Known limitation.** The heartbeat has no expiry, so a call that hangs rather than fails holds
-its message indefinitely. Capping it would not help: `nats-py` dispatches a subscription's
-callbacks serially, so a hung call blocks the consumer at the client whatever the server does
-with the ack — a cap would only release the claim while the work continued, producing a duplicate
-when it finally returned. Recovering from a hang means restarting the pod.
+**Known limitation.** The heartbeat has no expiry, so a call that hangs rather than fails would
+hold its message and — since `nats-py` dispatches a subscription's callbacks serially — block the
+consumer, recoverable only by restarting the pod. Every Groq call here is bounded by the SDK's
+60s-per-attempt default, so the exposure is small; `ai-worker` builds its client without a
+timeout and is the one that carries this risk. Bounding the heartbeat is not the answer either
+way: it would release the ack claim while the work continued and duplicate the message.
 
 ### Applying this to an existing consumer
 
@@ -49,9 +50,14 @@ nats consumer edit audio_events transcription-worker-consumer --max-deliver=3
 
 **Two commands, in that order, and check the backlog between them.** `--ack-wait` and
 `--max-pending` stop the amplification without dropping anything. `--max-deliver=3` discards every
-pending message already past three deliveries — against the measured backlog, all of them — as
-each comes up for redelivery, so apply it only once the backlog has drained (`nats consumer info
-audio_events transcription-worker-consumer`, watch `Unprocessed Messages` fall).
+message already past three deliveries as it comes up for redelivery — against the measured
+backlog, all of them — so apply it only once that set has drained.
+
+Check with `nats consumer info audio_events transcription-worker-consumer` and watch
+**`Outstanding Acks`** (`num_ack_pending`) fall to zero. Watch that field, not `Unprocessed
+Messages`: the latter is `num_pending`, the messages never delivered at all, and while the
+consumer is saturated at `max_ack_pending=1000` it reads zero even with the whole backlog sitting
+in the redelivery set. Reading it as "drained" is how you lose the backlog.
 
 Use `edit` rather than delete-and-recreate so the consumer keeps its ack floor and does not replay
 the stream from the start. `nats consumer info` is the source of truth for what is actually in

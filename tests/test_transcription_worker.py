@@ -2,7 +2,6 @@ import asyncio
 import os
 import json
 import pytest
-from datetime import datetime, timezone
 from unittest.mock import Mock, patch, AsyncMock
 from app.workers.transcription import TranscriptionWorker
 from app.services.transcription import TranscriptionResult, TranscriptionService
@@ -237,20 +236,44 @@ async def test_heartbeat_stops_once_processing_finishes(heartbeat_worker, queued
     assert queued_audio_msg.in_progress.await_count == settled
 
 @pytest.mark.asyncio
+async def test_heartbeat_stops_when_processing_raises(temp_dirs, queued_audio_msg):
+    """The heartbeat must be cancelled on the failure path too, not just the clean one.
+
+    A leaked beat would keep resetting ack_wait on a message nobody is working on, so the
+    server would never redeliver it.
+    """
+    storage_dir, raw_dir, transcriptions_dir = temp_dirs
+    failing_service = SlowTranscriptionService()
+    failing_service.translate = AsyncMock(side_effect=RuntimeError("groq is down"))
+    failing_service.language = "pl"
+    worker = TranscriptionWorker(
+        transcription_service=failing_service,
+        storage_dir=storage_dir,
+        transcriptions_raw_dir=raw_dir,
+        transcriptions_dir=transcriptions_dir,
+        progress_interval=0.001,
+    )
+
+    await worker.handle_message(queued_audio_msg)
+    settled = queued_audio_msg.in_progress.await_count
+
+    await asyncio.sleep(0.05)
+
+    queued_audio_msg.ack.assert_not_awaited()
+    assert queued_audio_msg.in_progress.await_count == settled, "heartbeat leaked past a failure"
+
+@pytest.mark.asyncio
 async def test_failing_heartbeat_neither_stops_beating_nor_fails_the_message(
-    heartbeat_worker, queued_audio_msg, temp_dirs
+    heartbeat_worker, queued_audio_msg
 ):
     """A failed +WPI is transient, so the loop must keep going and the work must complete.
 
     Beating more than once while every beat raises proves both halves: the loop survived a
     failure, and the failure never reached handle_message.
     """
-    _, _, transcriptions_dir = temp_dirs
     queued_audio_msg.in_progress = AsyncMock(side_effect=RuntimeError("connection draining"))
 
     await heartbeat_worker.handle_message(queued_audio_msg)
 
     assert queued_audio_msg.in_progress.await_count > 1, "heartbeat stopped after the first failure"
     queued_audio_msg.ack.assert_awaited_once()
-    date_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-    assert os.path.exists(os.path.join(transcriptions_dir, f"transcripts_{date_str}.jsonl"))

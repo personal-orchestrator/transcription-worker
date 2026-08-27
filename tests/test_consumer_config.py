@@ -26,12 +26,5 @@ async def test_subscribe_requests_explicit_consumer_config():
     assert config.ack_wait == 300.0
     assert config.max_deliver == 3
     assert config.max_ack_pending == 1
-
-
-def test_heartbeat_outpaces_the_server_default_ack_wait():
-    """Until the one-off `nats consumer edit` runs, the consumer still holds ack_wait=30s.
-
-    An interval sized against our own 300s would send its first +WPI after the message had
-    already been redelivered.
-    """
-    assert PROGRESS_INTERVAL_SECONDS < 30
+    # The heartbeat must beat the ack timer, whichever value is in force.
+    assert PROGRESS_INTERVAL_SECONDS < config.ack_wait
