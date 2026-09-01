@@ -11,7 +11,8 @@ async def test_subscribe_requests_explicit_consumer_config():
     """A newly created consumer must not be left on server defaults.
 
     Note this covers the creation path only: nats-py discards the config when the durable
-    already exists, which is why the README carries a one-off `nats consumer edit`.
+    already exists, which is why documentation/jetstream-consumer-configuration.md carries
+    one-off `nats consumer edit` steps.
     """
     app = Application()
     app.js = AsyncMock()

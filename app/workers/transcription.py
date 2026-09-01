@@ -17,7 +17,8 @@ from app.services.transcription import TranscriptionService, TranscriptionResult
 logger = logging.getLogger("transcription-worker")
 
 # Must stay below the consumer's ack_wait, including the 30s server default that applies until
-# the one-off `nats consumer edit` in the README has been run.
+# the one-off `nats consumer edit` steps in
+# documentation/jetstream-consumer-configuration.md have been run.
 PROGRESS_INTERVAL_SECONDS = 20.0
 
 class TranscriptionPayload(BaseModel):

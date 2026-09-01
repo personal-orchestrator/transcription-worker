@@ -13,7 +13,7 @@ one), far longer than the default 30s `ack_wait`. The values are constants in `a
 | progress interval | 20s | how often `msg.in_progress()` (`+WPI`) resets the ack timer while a file is in flight |
 
 The interval is 20s rather than something sized against our own 300s because it also has to beat
-the **30s server default** in force until the step below has been run.
+the **30s server default** in force until the `nats consumer edit` steps below have been run.
 
 **Known limitation.** The heartbeat has no expiry, so a call that hangs rather than fails would
 hold its message and — since `nats-py` dispatches a subscription's callbacks serially — block the

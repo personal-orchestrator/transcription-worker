@@ -28,7 +28,8 @@ class SubscriptionConfig:
 
 # Server defaults (ack_wait=30s, max_deliver=-1, max_ack_pending=1000) are wrong for a single
 # worker doing slow, rate-limited work. ACK_WAIT_SECONDS is a death-detection window, not a
-# duration budget — the msg.in_progress() heartbeat covers duration. See README.
+# duration budget — the msg.in_progress() heartbeat covers duration.
+# See documentation/jetstream-consumer-configuration.md.
 ACK_WAIT_SECONDS = 300.0
 MAX_DELIVER = 3
 MAX_ACK_PENDING = 1

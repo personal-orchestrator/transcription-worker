@@ -13,8 +13,7 @@ Dedicated, isolated audio transcription worker for the personal orchestrator pla
 
 ## JetStream consumer configuration
 
-The durable consumer sets `ack_wait`, `max_deliver` and `max_ack_pending` explicitly instead of
-taking the NATS server defaults, and holds the ack timer open with an `msg.in_progress()`
-heartbeat while a file is transcribed. The values, the reasoning behind them and the one-time
-command that applies them to a consumer which already exists are in
-[documentation/jetstream-consumer-configuration.md](documentation/jetstream-consumer-configuration.md).
+The durable consumer overrides the NATS server defaults, which do not suit slow, rate-limited
+transcription work. See
+[documentation/jetstream-consumer-configuration.md](documentation/jetstream-consumer-configuration.md)
+for the values, the reasoning, and the one-time steps for a consumer that already exists.
