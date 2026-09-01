@@ -10,3 +10,10 @@ Dedicated, isolated audio transcription worker for the personal orchestrator pla
 - Persists raw and translated transcripts into daily `.jsonl` files on disk (`/data/transcriptions-raw` and `/data/transcriptions`).
 - Emits `transcription.completed` events to NATS JetStream for downstream agent processing.
 - Includes a reindexing service to automatically scan and process untranscribed audio files.
+
+## JetStream consumer configuration
+
+The durable consumer overrides the NATS server defaults, which do not suit slow, rate-limited
+transcription work. See
+[documentation/jetstream-consumer-configuration.md](documentation/jetstream-consumer-configuration.md)
+for the values, the reasoning, and the one-time steps for a consumer that already exists.

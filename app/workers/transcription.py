@@ -1,8 +1,9 @@
+import asyncio
 import fcntl
 import json
 import logging
 import os
-from contextlib import contextmanager
+from contextlib import asynccontextmanager, contextmanager, suppress
 from datetime import datetime, timezone
 from typing import Optional, TYPE_CHECKING
 from pydantic import BaseModel, ValidationError
@@ -14,6 +15,11 @@ if TYPE_CHECKING:
 from app.services.transcription import TranscriptionService, TranscriptionResult
 
 logger = logging.getLogger("transcription-worker")
+
+# Must stay below the consumer's ack_wait, including the 30s server default that applies until
+# the one-off `nats consumer edit` steps in
+# documentation/jetstream-consumer-configuration.md have been run.
+PROGRESS_INTERVAL_SECONDS = 20.0
 
 class TranscriptionPayload(BaseModel):
     filename: str
@@ -32,7 +38,8 @@ class TranscriptionWorker:
         transcriptions_raw_dir: str, 
         transcriptions_dir: str, 
         nc: Optional['NatsClient'] = None, 
-        nats_transcriptions_subject: Optional[str] = None
+        nats_transcriptions_subject: Optional[str] = None,
+        progress_interval: float = PROGRESS_INTERVAL_SECONDS
     ):
         self.transcription_service = transcription_service
         self.storage_dir = storage_dir
@@ -40,6 +47,7 @@ class TranscriptionWorker:
         self.transcriptions_dir = transcriptions_dir
         self.nc = nc
         self.nats_transcriptions_subject = nats_transcriptions_subject
+        self.progress_interval = progress_interval
 
         os.makedirs(self.storage_dir, exist_ok=True)
         os.makedirs(self.transcriptions_raw_dir, exist_ok=True)
@@ -59,7 +67,8 @@ class TranscriptionWorker:
                 await msg.ack()
                 return
 
-            await self._process_file(file_path, payload.filename, payload.out_of_order)
+            async with self._keep_alive(msg):
+                await self._process_file(file_path, payload.filename, payload.out_of_order)
             await msg.ack()
 
         except ValidationError as e:
@@ -67,6 +76,30 @@ class TranscriptionWorker:
             await msg.ack()
         except Exception as e:
             logger.error(f"Error processing message: {e}", exc_info=True)
+
+    @asynccontextmanager
+    async def _keep_alive(self, msg: 'Msg'):
+        """Hold the message's ack_wait timer open for as long as the body takes."""
+        task = asyncio.create_task(self._send_progress(msg))
+        try:
+            yield
+        finally:
+            task.cancel()
+            with suppress(asyncio.CancelledError):
+                await task
+
+    async def _send_progress(self, msg: 'Msg') -> None:
+        """Periodically tell JetStream the message is still being worked on.
+
+        +WPI resets the ack timer without counting as a delivery, so a slow file stays on its
+        first delivery. A failed beat is transient (a reconnect), so the loop keeps going.
+        """
+        while True:
+            await asyncio.sleep(self.progress_interval)
+            try:
+                await msg.in_progress()
+            except Exception as e:
+                logger.warning(f"In-progress heartbeat failed, retrying next tick: {e}")
 
     def _get_file_path(self, filename: str) -> Optional[str]:
         file_path = os.path.join(self.storage_dir, filename)

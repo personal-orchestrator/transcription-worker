@@ -7,7 +7,7 @@ from typing import Callable, Awaitable, Any, List
 
 import nats
 from nats.aio.client import Client as NatsClient
-from nats.js import JetStreamContext
+from nats.js import JetStreamContext, api
 
 from app.config import settings
 from app.services.transcription import GroqTranscriptionService, TranscriptionService
@@ -25,6 +25,14 @@ class SubscriptionConfig:
     cb: Callable[[Any], Awaitable[None]]
     durable: str
     stream: str
+
+# Server defaults (ack_wait=30s, max_deliver=-1, max_ack_pending=1000) are wrong for a single
+# worker doing slow, rate-limited work. ACK_WAIT_SECONDS is a death-detection window, not a
+# duration budget — the msg.in_progress() heartbeat covers duration.
+# See documentation/jetstream-consumer-configuration.md.
+ACK_WAIT_SECONDS = 300.0
+MAX_DELIVER = 3
+MAX_ACK_PENDING = 1
 
 logging.basicConfig(level=settings.log_level, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("transcription-worker")
@@ -102,11 +110,17 @@ class Application:
             ),
         ]
         for cfg in configs:
+            config = api.ConsumerConfig(
+                ack_wait=ACK_WAIT_SECONDS,
+                max_deliver=MAX_DELIVER,
+                max_ack_pending=MAX_ACK_PENDING,
+            )
             sub = await self.js.subscribe(
                 cfg.subject,
                 cb=cfg.cb,
                 durable=cfg.durable,
                 stream=cfg.stream,
+                config=config,
             )
             self.subscriptions.append(sub)
             logger.info(f"Subscribed to {cfg.subject} (durable: {cfg.durable}, stream: {cfg.stream})")

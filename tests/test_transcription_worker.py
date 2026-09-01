@@ -1,3 +1,4 @@
+import asyncio
 import os
 import json
 import pytest
@@ -182,3 +183,97 @@ async def test_handle_message_non_english(temp_dirs):
         translated_data = json.loads(f.readlines()[0])
         assert translated_data["transcription"] == "This is a translated test transcription"
         assert translated_data["language"] == "en"
+
+class SlowTranscriptionService(MockTranscriptionService):
+    """Transcription slow enough to outlive a short heartbeat interval."""
+
+    async def transcribe(self, audio_file_path: str) -> TranscriptionResult:
+        await asyncio.sleep(0.05)
+        return await super().transcribe(audio_file_path)
+
+@pytest.fixture
+def heartbeat_worker(temp_dirs):
+    storage_dir, transcriptions_raw_dir, transcriptions_dir = temp_dirs
+    return TranscriptionWorker(
+        transcription_service=SlowTranscriptionService(),
+        storage_dir=storage_dir,
+        transcriptions_raw_dir=transcriptions_raw_dir,
+        transcriptions_dir=transcriptions_dir,
+        progress_interval=0.001,
+    )
+
+@pytest.fixture
+def queued_audio_msg(temp_dirs):
+    """A JetStream message whose audio file exists on disk."""
+    storage_dir = temp_dirs[0]
+    filename = "slow_audio.m4a"
+    os.makedirs(storage_dir, exist_ok=True)
+    with open(os.path.join(storage_dir, filename), "wb") as f:
+        f.write(b"dummy data")
+
+    msg = Mock()
+    msg.subject = "audio.ingested"
+    msg.data = json.dumps({"filename": filename}).encode("utf-8")
+    msg.ack = AsyncMock()
+    msg.in_progress = AsyncMock()
+    return msg
+
+@pytest.mark.asyncio
+async def test_heartbeat_sent_while_transcribing(heartbeat_worker, queued_audio_msg):
+    await heartbeat_worker.handle_message(queued_audio_msg)
+
+    assert queued_audio_msg.in_progress.await_count > 0
+    queued_audio_msg.ack.assert_awaited_once()
+
+@pytest.mark.asyncio
+async def test_heartbeat_stops_once_processing_finishes(heartbeat_worker, queued_audio_msg):
+    await heartbeat_worker.handle_message(queued_audio_msg)
+    settled = queued_audio_msg.in_progress.await_count
+
+    await asyncio.sleep(0.05)
+
+    assert settled > 0, "no heartbeat ran, so this proves nothing about it stopping"
+    assert queued_audio_msg.in_progress.await_count == settled
+
+@pytest.mark.asyncio
+async def test_heartbeat_stops_when_processing_raises(temp_dirs, queued_audio_msg):
+    """The heartbeat must be cancelled on the failure path too, not just the clean one.
+
+    A leaked beat would keep resetting ack_wait on a message nobody is working on, so the
+    server would never redeliver it.
+    """
+    storage_dir, raw_dir, transcriptions_dir = temp_dirs
+    failing_service = SlowTranscriptionService()
+    failing_service.translate = AsyncMock(side_effect=RuntimeError("groq is down"))
+    failing_service.language = "pl"
+    worker = TranscriptionWorker(
+        transcription_service=failing_service,
+        storage_dir=storage_dir,
+        transcriptions_raw_dir=raw_dir,
+        transcriptions_dir=transcriptions_dir,
+        progress_interval=0.001,
+    )
+
+    await worker.handle_message(queued_audio_msg)
+    settled = queued_audio_msg.in_progress.await_count
+
+    await asyncio.sleep(0.05)
+
+    queued_audio_msg.ack.assert_not_awaited()
+    assert queued_audio_msg.in_progress.await_count == settled, "heartbeat leaked past a failure"
+
+@pytest.mark.asyncio
+async def test_failing_heartbeat_neither_stops_beating_nor_fails_the_message(
+    heartbeat_worker, queued_audio_msg
+):
+    """A failed +WPI is transient, so the loop must keep going and the work must complete.
+
+    Beating more than once while every beat raises proves both halves: the loop survived a
+    failure, and the failure never reached handle_message.
+    """
+    queued_audio_msg.in_progress = AsyncMock(side_effect=RuntimeError("connection draining"))
+
+    await heartbeat_worker.handle_message(queued_audio_msg)
+
+    assert queued_audio_msg.in_progress.await_count > 1, "heartbeat stopped after the first failure"
+    queued_audio_msg.ack.assert_awaited_once()
