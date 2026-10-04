@@ -16,4 +16,4 @@ Dedicated, isolated audio transcription worker for the personal orchestrator pla
 The durable consumer overrides the NATS server defaults, which do not suit slow, rate-limited
 transcription work. See
 [documentation/jetstream-consumer-configuration.md](documentation/jetstream-consumer-configuration.md)
-for the values, the reasoning, and the one-time steps for a consumer that already exists.
+for the values and the reasoning.
